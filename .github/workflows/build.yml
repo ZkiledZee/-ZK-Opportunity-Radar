@@ -15,6 +15,240 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
+name: Build ZK Opportunity Radar IPA
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "ZK_Opportunity_Radar_v*_SOURCE.zip"
+
+concurrency:
+  group: zk-radar-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect newest Radar version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_ZIP=$(python3 <<'PY'
+          import glob
+          import re
+          import sys
+
+          found = []
+          for path in glob.glob("ZK_Opportunity_Radar_v*_SOURCE.zip"):
+              match = re.fullmatch(
+                  r"ZK_Opportunity_Radar_v(\d+)\.(\d+)\.(\d+)_SOURCE\.zip",
+                  path
+              )
+              if match:
+                  found.append((tuple(map(int, match.groups())), path))
+
+          if not found:
+              print("No correctly named Radar source ZIP found.", file=sys.stderr)
+              sys.exit(1)
+
+          found.sort()
+          print(found[-1][1])
+          PY
+          )
+
+          NAME=$(basename "$SOURCE_ZIP")
+          VERSION=$(echo "$NAME" | sed -E 's/^ZK_Opportunity_Radar_v([0-9]+\.[0-9]+\.[0-9]+)_SOURCE\.zip$/\1/')
+          IPA_NAME="ZK-Opportunity-Radar-v${VERSION}.ipa"
+
+          echo "source_zip=$SOURCE_ZIP" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "ipa_name=$IPA_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Extract source
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf project
+          mkdir -p project
+          unzip -q -o "${{ steps.version.outputs.source_zip }}" -d project
+
+          PROJECT_YML=$(find project -maxdepth 4 -name project.yml -type f -print -quit)
+          if [ -z "$PROJECT_YML" ]; then
+            echo "project.yml was not found."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$PROJECT_YML")
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Apply app version
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_DIR="${{ steps.project.outputs.project_dir }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          BUILD_NUMBER="${{ github.run_number }}"
+
+          python3 - "$PROJECT_DIR" "$VERSION" "$BUILD_NUMBER" <<'PY'
+          import plistlib
+          import re
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          version = sys.argv[2]
+          build = sys.argv[3]
+          project_yml = root / "project.yml"
+          text = project_yml.read_text(encoding="utf-8")
+          text = re.sub(r'(?m)^(\s*MARKETING_VERSION:\s*).+$', rf'\g<1>{version}', text)
+          text = re.sub(r'(?m)^(\s*CURRENT_PROJECT_VERSION:\s*).+$', rf'\g<1>{build}', text)
+          project_yml.write_text(text, encoding="utf-8")
+
+          for plist_path in root.rglob("Info.plist"):
+              try:
+                  with plist_path.open("rb") as file:
+                      data = plistlib.load(file)
+                  if isinstance(data, dict):
+                      data["CFBundleShortVersionString"] = version
+                      data["CFBundleVersion"] = build
+                      with plist_path.open("wb") as file:
+                          plistlib.dump(data, file)
+              except Exception as exc:
+                  print(f"Skipping {plist_path}: {exc}")
+          PY
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+
+      - name: Generate Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${{ steps.project.outputs.project_dir }}"
+          xcodegen generate
+
+      - name: Build iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${{ steps.project.outputs.project_dir }}"
+          PROJECT=$(find . -maxdepth 1 -name '*.xcodeproj' -type d -print -quit)
+          if [ -z "$PROJECT" ]; then
+            echo "Xcode project was not generated."
+            exit 1
+          fi
+
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme ZKOpportunityRadar \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            clean build
+
+      - name: Validate SideStore app
+        id: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_DIR="${{ steps.project.outputs.project_dir }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          BUILD_NUMBER="${{ github.run_number }}"
+
+          APP_PATH=$(find "$PROJECT_DIR/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' -type d -print -quit)
+          if [ -z "$APP_PATH" ]; then
+            echo "Built .app was not found."
+            exit 1
+          fi
+
+          PLIST="$APP_PATH/Info.plist"
+          APP_NAME=$(basename "$APP_PATH" .app)
+
+          set_key() {
+            local key="$1"
+            local type="$2"
+            local value="$3"
+            /usr/libexec/PlistBuddy -c "Set :$key $value" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :$key $type $value" "$PLIST"
+          }
+
+          set_key CFBundleIdentifier string "com.zk.opportunityradar"
+          set_key CFBundlePackageType string "APPL"
+          set_key CFBundleShortVersionString string "$VERSION"
+          set_key CFBundleVersion string "$BUILD_NUMBER"
+
+          EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST" 2>/dev/null || true)
+          if [ -z "$EXECUTABLE" ]; then
+            EXECUTABLE="$APP_NAME"
+            set_key CFBundleExecutable string "$EXECUTABLE"
+          fi
+
+          if [ ! -f "$APP_PATH/$EXECUTABLE" ]; then
+            echo "Executable missing: $APP_PATH/$EXECUTABLE"
+            exit 1
+          fi
+
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          IPA_NAME="${{ steps.version.outputs.ipa_name }}"
+          APP_PATH="${{ steps.app.outputs.app_path }}"
+
+          rm -rf output
+          mkdir -p output/Payload
+          cp -R "$APP_PATH" output/Payload/
+          cd output
+          ditto -c -k --sequesterRsrc --keepParent Payload "$IPA_NAME"
+          test -f "$IPA_NAME"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZK-Opportunity-Radar-v${{ steps.version.outputs.version }}-IPA
+          path: output/${{ steps.version.outputs.ipa_name }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          IPA="output/${{ steps.version.outputs.ipa_name }}"
+          TAG="v$VERSION"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$IPA" --clobber
+          else
+            gh release create "$TAG" "$IPA" \
+              --title "ZK Opportunity Radar v$VERSION" \
+              --notes "Native iOS ZK Opportunity Radar v$VERSION. Install through SideStore."
+          fi
       - name: Generate project settings
         run: |
           cat > project.yml <<'PROJECT'
